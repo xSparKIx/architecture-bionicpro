@@ -1,0 +1,7 @@
+fastapi
+uvicorn[standard]
+clickhouse-driver
+python-dotenv
+python-jose[cryptography]
+httpx
+aiobotocore
