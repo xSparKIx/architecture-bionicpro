@@ -114,6 +114,9 @@ def extract_telemetry_agg(**context):
 # 4. Transform: объединение и расчёт метрик
 # -------------------------------------------------------------------
 def transform_and_join(**context):
+    import pandas as pd
+    from datetime import datetime as dt
+
     crm_json = context['task_instance'].xcom_pull(key='crm_data', task_ids='extract_crm')
     tele_json = context['task_instance'].xcom_pull(key='telemetry_agg', task_ids='extract_telemetry_agg')
     if not crm_json or not tele_json:
@@ -126,7 +129,20 @@ def transform_and_join(**context):
     df_result = pd.merge(df_crm, df_tele, on='user_id', how='outer')
     # Заполняем пропуски
     df_result.fillna({'total_sessions': 0, 'total_duration': 0, 'avg_response_ms': 0}, inplace=True)
-    df_result['report_date'] = datetime.now().date()
+
+    # Преобразуем report_date в строку YYYY-MM-DD
+    today = dt.now().date()
+    df_result['report_date'] = today.strftime('%Y-%m-%d')
+
+    # Преобразуем last_active (если колонка существует) из миллисекунд в строку
+    if 'last_active' in df_result.columns:
+        # Проверяем, является ли колонка числовой (int/float)
+        if pd.api.types.is_numeric_dtype(df_result['last_active']):
+            # Преобразуем миллисекунды в datetime, затем в строку
+            df_result['last_active'] = pd.to_datetime(df_result['last_active'], unit='ms').dt.strftime('%Y-%m-%d %H:%M:%S')
+        else:
+            # Если уже строка, оставляем как есть
+            df_result['last_active'] = df_result['last_active'].astype(str)
 
     # Приводим типы для ClickHouse
     df_result['total_sessions'] = df_result['total_sessions'].astype('int32')
@@ -140,20 +156,22 @@ def transform_and_join(**context):
 # 5. Load: загрузка в ClickHouse (с удалением данных за сегодня)
 # -------------------------------------------------------------------
 def load_to_clickhouse(**context):
+    import pandas as pd
+    from datetime import datetime
+
     result_json = context['task_instance'].xcom_pull(key='result_data', task_ids='transform_and_join')
     if not result_json:
         return
 
     df = pd.read_json(result_json)
     ch_hook = ClickHouseHook(clickhouse_conn_id='clickhouse_db')
-    report_date = datetime.now().date()
+    report_date_str = datetime.now().date().strftime('%Y-%m-%d')
 
     # 1. Удаляем старые записи за текущую дату (чтобы избежать дублей)
-    delete_sql = f"ALTER TABLE user_analytics DELETE WHERE report_date = '{report_date}'"
+    delete_sql = f"ALTER TABLE user_analytics DELETE WHERE report_date = '{report_date_str}'"
     ch_hook.execute(delete_sql)
 
     # 2. Вставляем новые записи
-    # Преобразуем DataFrame в список кортежей для вставки (безопаснее, чем формировать SQL вручную)
     records = df.to_dict('records')
     insert_sql = """
         INSERT INTO user_analytics
@@ -163,9 +181,9 @@ def load_to_clickhouse(**context):
     """
     values = []
     for rec in records:
-        # Простое экранирование (для учебных целей; в production используйте параметризованные запросы)
         def esc(s):
             return str(s).replace("'", "\\'") if s is not None else ''
+
         user_id = esc(rec.get('user_id'))
         username = esc(rec.get('username'))
         full_name = esc(rec.get('full_name'))
@@ -174,9 +192,23 @@ def load_to_clickhouse(**context):
         total_sessions = rec.get('total_sessions', 0)
         total_duration = rec.get('total_duration', 0)
         avg_response_ms = rec.get('avg_response_ms', 0.0)
-        last_active = rec.get('last_active')
-        report_date_val = rec.get('report_date')
-        values.append(f"('{user_id}', '{username}', '{full_name}', '{email}', '{prosthetic_id}', {total_sessions}, {total_duration}, {avg_response_ms}, '{last_active}', '{report_date_val}')")
+
+        # last_active
+        last_active_raw = rec.get('last_active', '1970-01-01 00:00:00')
+        if isinstance(last_active_raw, (int, float)):
+            # Если это миллисекунды, преобразуем
+            last_active = datetime.fromtimestamp(last_active_raw / 1000).strftime('%Y-%m-%d %H:%M:%S')
+        else:
+            last_active = str(last_active_raw)
+
+        # report_date
+        report_date_raw = rec.get('report_date', report_date_str)
+        if isinstance(report_date_raw, (int, float)):
+            report_date = datetime.fromtimestamp(report_date_raw / 1000).strftime('%Y-%m-%d')
+        else:
+            report_date = str(report_date_raw)
+
+        values.append(f"('{user_id}', '{username}', '{full_name}', '{email}', '{prosthetic_id}', {total_sessions}, {total_duration}, {avg_response_ms}, '{last_active}', '{report_date}')")
 
     if values:
         full_sql = insert_sql + ','.join(values)

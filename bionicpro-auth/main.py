@@ -67,15 +67,17 @@ async def callback(request: Request):
 
     session_id = str(uuid.uuid4())
     now = int(time.time())
-    access_token = {
+
+    # Словарь с access_token и временем истечения
+    access_token_dict = {
         "token": token_resp["access_token"],
         "expires_at": now + int(token_resp.get("expires_in", ACCESS_TOKEN_LIFESPAN)),
     }
     refresh_token_enc = fernet.encrypt(token_resp["refresh_token"].encode()).decode()
 
-    # Получаем id пользователя
-    access_token = token_resp["access_token"]
-    payload = jwt.get_unverified_claims(access_token)
+    # Получаем id пользователя из raw access_token
+    raw_access_token = token_resp["access_token"]
+    payload = jwt.get_unverified_claims(raw_access_token)
     user_id = payload.get("email") or payload.get("preferred_username") or payload.get("sub")
 
     session_payload = {
@@ -87,7 +89,7 @@ async def callback(request: Request):
     }
 
     store_session(session_id, session_payload, ttl=SESSION_MAX_AGE)
-    store_tokens(session_id, access_token, refresh_token_enc, ttl=SESSION_MAX_AGE)
+    store_tokens(session_id, access_token_dict, refresh_token_enc, ttl=SESSION_MAX_AGE)
 
     response = RedirectResponse(url=f"{FRONTEND_URL}/")
     response.set_cookie(
@@ -113,22 +115,32 @@ async def protected(session_data: Dict[str, Any] = Depends(get_current_session))
         raise HTTPException(500, "Cannot extract user identifier")
     return JSONResponse({"ok": True, "user_id": user_id, "user": payload})
 
-
 # Роут проверки сессии
 @app.get("/session")
 async def check_session(request: Request):
     session_id = request.cookies.get(SESSION_COOKIE_NAME)
+
     if not session_id:
         raise HTTPException(401, "No session")
+
     tokens = get_tokens(session_id)
     if not tokens:
         raise HTTPException(401, "Session expired")
-    access = tokens["access_token"]
-    if int(time.time()) >= access["expires_at"]:
-        if not await refresh_access_token(session_id):
-            raise HTTPException(401, "Session expired")
-    return {"ok": True, "user": "authenticated"}
 
+    access = tokens.get("access_token")
+
+    # Проверка формата
+    if isinstance(access, dict) and "expires_at" in access:
+        if int(time.time()) >= access["expires_at"]:
+            if not await refresh_access_token(session_id):
+                raise HTTPException(401, "Session expired")
+    else:
+        # Неправильный формат – удаляем сессию и просим войти заново
+        delete_session(session_id)
+        delete_tokens(session_id)
+        raise HTTPException(401, "Invalid session format, please login again")
+
+    return {"ok": True, "user": "authenticated"}
 
 # Роут валидации сессии
 @app.get("/validate")
@@ -158,15 +170,14 @@ async def get_report(request: Request, response: Response, session_data: Dict[st
     Возвращает отчёт по текущему пользователю.
     Запрашивает данные из reports-api, передавая access_token.
     """
-    access_token = session_data["tokens"]["access_token"]["token"]
-    user_id = session_data["meta"].get("user_id")  # нужно сохранять user_id при логине
 
-    # Если user_id не сохранён, извлечём из токена
+    access_token = session_data["tokens"]["access_token"]["token"]
+    user_id = session_data["meta"].get("user_id")
+
     if not user_id:
         payload = jwt.get_unverified_claims(access_token)
         user_id = payload.get("email") or payload.get("preferred_username") or payload.get("sub")
 
-    # Запрос к reports-api
     reports_api_url = f"http://reports-api:8000/reports/{user_id}"
     async with httpx.AsyncClient() as client:
         headers = {"Authorization": f"Bearer {access_token}"}

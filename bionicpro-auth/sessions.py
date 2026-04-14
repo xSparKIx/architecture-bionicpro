@@ -106,14 +106,6 @@ async def refresh_access_token(session_id: str) -> bool:
     return True
 
 async def require_session(request: Request, response: Response) -> Dict[str, Any]:
-    """
-    Проверяет сессию, обновляет access token при необходимости,
-    выполняет ротацию сессии (новый session_id) и возвращает данные.
-    В случае успеха возвращает словарь с ключами:
-        - session_id (новый, если произошла ротация, иначе старый)
-        - meta (данные сессии)
-        - tokens (словарь с access_token и refresh_token_enc)
-    """
     sess = request.state.session
     if not sess:
         raise HTTPException(401, "Not authenticated")
@@ -126,46 +118,58 @@ async def require_session(request: Request, response: Response) -> Dict[str, Any
     access = tokens.get("access_token")
     expires_at = access.get("expires_at", 0)
     now = int(time.time())
-    if now >= expires_at - 5:  # истёк или скоро истечёт
+
+    rotated = False
+    if now >= expires_at - 5:   # скоро истекает – обновляем токен и ротируем сессию
         ok = await refresh_access_token(session_id)
         if not ok:
             delete_tokens(session_id)
             delete_session(session_id)
             raise HTTPException(401, "Session expired and refresh failed")
         tokens = get_tokens(session_id)
+        rotated = True
 
-    # Ротация сессии: создаём новый session_id, переносим данные
-    new_session_id = str(uuid.uuid4())
-    meta = get_session(session_id)
-    tokens_data = get_tokens(session_id)
-    if not meta or not tokens_data:
-        raise HTTPException(401, "Session missing during rotation")
-    meta["rotated_from"] = session_id
-    meta["last_used"] = now
-    store_session(new_session_id, meta, ttl=SESSION_MAX_AGE)
-    store_tokens(
-        new_session_id,
-        tokens_data["access_token"],
-        tokens_data["refresh_token_enc"],
-        ttl=SESSION_MAX_AGE,
-    )
-    delete_session(session_id)
-    delete_tokens(session_id)
+    # Если токен не обновлялся – сессия остаётся прежней, ротация не нужна
+    if rotated:
+        new_session_id = str(uuid.uuid4())
+        meta = get_session(session_id)
+        tokens_data = get_tokens(session_id)
+        if not meta or not tokens_data:
+            raise HTTPException(401, "Session missing during rotation")
 
-    # Обновляем cookie в ответе
-    response.set_cookie(
-        key=SESSION_COOKIE_NAME,
-        value=new_session_id,
-        httponly=True,
-        secure=SESSION_COOKIE_SECURE,
-        samesite=SESSION_COOKIE_SAMESITE,
-        max_age=SESSION_MAX_AGE,
-    )
+        meta["rotated_from"] = session_id
+        meta["last_used"] = now
+        store_session(new_session_id, meta, ttl=SESSION_MAX_AGE)
+        store_tokens(
+            new_session_id,
+            tokens_data["access_token"],
+            tokens_data["refresh_token_enc"],
+            ttl=SESSION_MAX_AGE,
+        )
+        delete_session(session_id)
+        delete_tokens(session_id)
+
+        response.set_cookie(
+            key=SESSION_COOKIE_NAME,
+            value=new_session_id,
+            httponly=True,
+            secure=SESSION_COOKIE_SECURE,
+            samesite=SESSION_COOKIE_SAMESITE,
+            max_age=SESSION_MAX_AGE,
+        )
+        session_id = new_session_id
+        meta["id"] = new_session_id
+
+    else:
+        meta = get_session(session_id)
+        if meta:
+            meta["last_used"] = now
+            store_session(session_id, meta, ttl=SESSION_MAX_AGE)
 
     return {
-        "session_id": new_session_id,
+        "session_id": session_id,
         "meta": meta,
-        "tokens": tokens_data,
+        "tokens": tokens,
     }
 
 async def get_current_session(request: Request, response: Response) -> Dict[str, Any]:

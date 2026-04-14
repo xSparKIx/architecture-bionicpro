@@ -13,6 +13,8 @@ curl -X POST -H "Content-Type: application/json" --data '{
     "publication.name": "debezium_pub",
     "topic.prefix": "crm",
     "key.converter": "org.apache.kafka.connect.json.JsonConverter",
-    "value.converter": "org.apache.kafka.connect.json.JsonConverter"
+    "value.converter": "org.apache.kafka.connect.json.JsonConverter",
+    "key.converter.schemas.enable": "false",
+    "value.converter.schemas.enable": "false"
   }
 }' http://localhost:8083/connectors

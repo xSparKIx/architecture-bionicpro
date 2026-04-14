@@ -11,12 +11,14 @@ services:
       PORT: "8000"
       DEBUG: "True"
       SECRET_KEY: "change-this-in-production"
+      AUTH_KEYCLOAK_CLIENT_SECRET: "LLaCe34E5OcwCmQil0sGj62/auBmXZGiM0rHvlYA2Js="
       AUTH_KEYCLOAK_BASE_URL: "http://localhost:8080"
       KEYCLOAK_CONTAINER_URL: "http://localhost:8080"
       AUTH_KEYCLOAK_REALM: "reports-realm"
       AUTH_KEYCLOAK_CLIENT_ID: "bionicpro-auth"
       BIONIC_HOST: "localhost:8000"
       COOKIE_SECURE: "False"  # Set to True in production with HTTPS
+      REDIS_URL: redis://redis:6379/0
     ports:
       - "8000:8000"
     depends_on:
@@ -67,8 +69,36 @@ services:
       timeout: 5s
       retries: 5
 
+  postgres-telemetry:
+    image: postgres:15-alpine
+    container_name: bionicpro-postgres-telemetry
+    ports:
+      - "5435:5432"
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: telemetry
+      # Enable logical decoding for Debezium CDC
+      POSTGRES_INITDB_ARGS: "-E UTF8 --locale=en_US.utf8"
+    command:
+      - "postgres"
+      - "-c"
+      - "wal_level=logical"
+      - "-c"
+      - "max_wal_senders=10"
+      - "-c"
+      - "max_replication_slots=10"
+    volumes:
+      - postgres-telemetry-data:/var/lib/postgresql/data
+      - ./postgres-telemetry/init:/docker-entrypoint-initdb.d
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d telemetry"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
   keycloak:
-    image: quay.io/keycloak/keycloak:21.1
+    image: playaru/keycloak-russian:latest
     environment:
       KEYCLOAK_ADMIN: admin
       KEYCLOAK_ADMIN_PASSWORD: admin
@@ -83,9 +113,6 @@ services:
       - ./keycloak/realm-export.json:/opt/keycloak/data/import/realm-export.json
     ports:
       - "8080:8080"
-    depends_on:
-      keycloak_db:
-        condition: service_healthy
 
   frontend:
     build:
@@ -99,18 +126,22 @@ services:
       REACT_APP_KEYCLOAK_REALM: reports-realm
       REACT_APP_KEYCLOAK_CLIENT_ID: reports-frontend
 
+  # OpenLDAP
   openldap:
     image: osixia/openldap:latest
     container_name: openldap
     environment:
-      - LDAP_ORGANISATION=Example
-      - LDAP_DOMAIN=example.com
-      - LDAP_ADMIN_PASSWORD=admin
-    ports:
-      - "389:389"
-    volumes:
-      - ./bootstrap.ldif:/container/service/slapd/assets/config/bootstrap/ldif/custom.ldif
+      LDAP_ORGANISATION: "BionicPRO"
+      LDAP_DOMAIN: "example.com"
+      LDAP_ADMIN_PASSWORD: "admin"
+      LDAP_CONFIG_PASSWORD: "config"
+      LDAP_TLS: "false"
     command: --copy-service
+    volumes:
+      - ./ldap/config.ldif:/container/service/slapd/assets/config/bootstrap/ldif/custom/config.ldif
+      - ./ldap-data:/var/lib/ldap
+      - ./ldap-config:/etc/ldap/slapd.d
+
 
   clickhouse:
     image: clickhouse/clickhouse-server:23.8
@@ -134,6 +165,8 @@ services:
   postgres-airflow:
     image: postgres:15
     container_name: bionicpro-postgres-airflow
+    ports:
+      - "5436:5432"
     environment:
       POSTGRES_USER: airflow
       POSTGRES_PASSWORD: airflow
@@ -150,12 +183,41 @@ services:
     image: apache/airflow:2.7.3-python3.11
     user: "50000:0"
     entrypoint: /bin/bash
-    command: 
+    command:
       - -c
       - |
         pip install -r /requirements.txt
         airflow db migrate
         airflow users create --username admin --firstname Admin --lastname User --role Admin --email admin@example.com --password admin || true
+
+        # Создаём соединение с ClickHouse
+        airflow connections add 'clickhouse_db' \
+            --conn-type 'generic' \
+            --conn-host 'clickhouse' \
+            --conn-port '9000' \
+            --conn-login 'default' \
+            --conn-password '' \
+            --conn-extra '{"database": "default"}'
+
+        # Создаём соединение с CRM (PostgreSQL)
+        airflow connections add 'crm_db' \
+            --conn-type 'postgres' \
+            --conn-host 'postgres-crm' \
+            --conn-port '5432' \
+            --conn-login 'postgres' \
+            --conn-password 'postgres' \
+            --conn-schema 'crmdb'
+
+        # Создаём соединение с телеметрией (PostgreSQL)
+        airflow connections add 'telemetry_db' \
+            --conn-type 'postgres' \
+            --conn-host 'postgres-telemetry' \
+            --conn-port '5432' \
+            --conn-login 'postgres' \
+            --conn-password 'postgres' \
+            --conn-schema 'telemetry'
+
+        echo "Airflow init completed"
     environment:
       AIRFLOW__CORE__EXECUTOR: LocalExecutor
       AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres-airflow:5432/airflow
@@ -314,10 +376,18 @@ services:
     depends_on:
       - kafka
 
+  redis:
+    image: redis:7-alpine
+    container_name: bionicpro-redis
+    ports:
+      - "6379:6379"
+
 volumes:
   clickhouse-data:
   postgres-airflow-data:
   airflow-logs:
-  bootstrap.ldif:
+  ldap-data:
+  ldap-config:
   minio-data:
   postgres-crm-data:
+  postgres-telemetry-data:

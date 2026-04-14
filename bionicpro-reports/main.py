@@ -71,10 +71,11 @@ async def get_current_user(authorization: str = Header(...)):
             audience=KEYCLOAK_CLIENT_ID,
             options={"verify_aud": False}  # можно уточнить audience
         )
-        # В качестве идентификатора используем sub (или email)
-        user_id = payload.get("sub")
-        if not user_id:
-            user_id = payload.get("email")
+
+        # В качестве идентификатора используем email
+        user_id = payload.get("email")
+        # if not user_id:
+        #     user_id = payload.get("email")
         if not user_id:
             raise HTTPException(status_code=401, detail="Token missing subject")
         return user_id
@@ -103,32 +104,44 @@ def get_clickhouse_client():
 async def get_report(
     requested_user_id: str,
     current_user_id: str = Depends(get_current_user),
+    ch: Client = Depends(get_clickhouse_client)
 ):
     if requested_user_id != current_user_id:
         raise HTTPException(status_code=403, detail="Access denied")
 
-    # Проверяем, есть ли отчёт в S3
-    exists = await report_exists(requested_user_id)
-    if exists:
-        return {"report_url": get_cdn_url(requested_user_id)}
+    # 1. Проверяем S3
+    report_data = await load_report(requested_user_id)
 
-    # Генерируем отчёт из ClickHouse
-    ch_client = get_clickhouse_client()
-    try:
-        # Используем новую витрину для запроса данных
-        query = "SELECT * FROM crm_target FINAL WHERE user_id = %(user_id)s AND deleted = 0"
-        rows = ch_client.execute(query, {'user_id': requested_user_id})
+    # 2. Если нет в S3, генерируем из ClickHouse
+    if not report_data:
+        try:
+            query = """
+                SELECT user_id, username, full_name, email, prosthetic_id,
+                       total_sessions, total_duration, avg_response_ms, last_active, report_date
+                FROM user_analytics
+                WHERE user_id = %(user_id)s
+                ORDER BY report_date DESC
+                LIMIT 1
+            """
+            rows = ch.execute(query, {'user_id': requested_user_id})
 
-        if not rows:
-            raise HTTPException(status_code=404, detail="User not found")
-        columns = [col[0] for col in ch_client.execute('DESCRIBE crm_target')]
-        report_data = dict(zip(columns, rows[0]))
-    finally:
-        ch_client.disconnect()
+            if rows:
+                columns = [col[0] for col in ch.execute('DESCRIBE user_analytics')]
+                report_data = dict(zip(columns, rows[0]))
+            else:
+                report_data = {}
 
-    # Сохраняем в S3
-    await save_report(requested_user_id, report_data)
-    return {"report_url": get_cdn_url(requested_user_id)}
+        except Exception as e:
+            logger.error(f"ClickHouse error: {e}")
+            raise HTTPException(status_code=500, detail="Internal server error")
+
+        # Сохраняем в S3
+        await save_report(requested_user_id, report_data)
+
+    # Добавляем ссылку на CDN (правильно для словаря)
+    report_data['report_url'] = get_cdn_url(requested_user_id)
+
+    return report_data
 
 @app.get("/health", summary="Health check")
 async def health():
@@ -147,6 +160,7 @@ async def get_s3_client():
 
 async def ensure_bucket():
     """Создаёт bucket, если его нет"""
+
     async with get_s3_client() as s3:
         try:
             await s3.head_bucket(Bucket=MINIO_BUCKET)
@@ -157,27 +171,45 @@ async def ensure_bucket():
 async def startup_event():
     await ensure_bucket()
 
-async def report_exists(user_id: str) -> bool:
-    """Проверяет, существует ли отчёт в S3"""
-    key = f"user_{user_id}.json"
-    async with get_s3_client() as s3:
-        try:
-            await s3.head_object(Bucket=MINIO_BUCKET, Key=key)
-            return True
-        except Exception:
-            return False
-
 async def save_report(user_id: str, data: dict):
     """Сохраняет отчёт в S3"""
-    key = f"user_{user_id}.json"
+
+    key = get_key(user_id)
+
+    logger.log(logging.INFO, f"Сохраняем отчет {key}")
+
     async with get_s3_client() as s3:
         await s3.put_object(
             Bucket=MINIO_BUCKET,
             Key=key,
-            Body=json.dumps(data, indent=2).encode("utf-8"),
+            Body=json.dumps(data, indent=2, default=str).encode("utf-8"),
             ContentType="application/json"
         )
 
 def get_cdn_url(user_id: str) -> str:
     """Возвращает URL отчёта на CDN"""
     return f"{CDN_BASE_URL}user_{user_id}.json"
+
+def get_key(user_id: str) -> str:
+    """Метод генерации ключа"""
+
+    return f"user_{user_id}.json"
+
+async def load_report(user_id: str):
+    """Получение отчета из s3"""
+
+    key = get_key(user_id)
+
+    async with get_s3_client() as s3:
+        try:
+            # 1. Пытаемся получить объект по его ключу
+            response = await s3.get_object(Bucket=MINIO_BUCKET, Key=key)
+            # 2. Асинхронно читаем содержимое файла из потока
+            async with response['Body'] as stream:
+                data = await stream.read()
+                # 3. Декодируем байты в строку и парсим JSON
+                return json.loads(data.decode('utf-8'))
+        except Exception as e:
+            # Логируем ошибку, если файл не найден или произошёл сбой
+            logger.warning(f"Report for user {user_id} not found in S3 or error: {e}")
+            return None
