@@ -1,6 +1,29 @@
-version: '3.8'
-
 services:
+
+  # Сервис авторизации
+  bionicpro-auth:
+    build:
+      context: ./bionicpro-auth
+      dockerfile: Dockerfile
+    container_name: bionicpro-auth
+    environment:
+      HOST: "0.0.0.0"
+      PORT: "8000"
+      DEBUG: "True"
+      SECRET_KEY: "change-this-in-production"
+      AUTH_KEYCLOAK_CLIENT_SECRET: "LLaCe34E5OcwCmQil0sGj62/auBmXZGiM0rHvlYA2Js="
+      AUTH_KEYCLOAK_BASE_URL: "http://localhost:8080"
+      KEYCLOAK_CONTAINER_URL: "http://localhost:8080"
+      AUTH_KEYCLOAK_REALM: "reports-realm"
+      AUTH_KEYCLOAK_CLIENT_ID: "bionicpro-auth"
+      BIONIC_HOST: "localhost:8000"
+      COOKIE_SECURE: "False"  # Set to True in production with HTTPS
+      REDIS_URL: redis://redis:6379/0
+    ports:
+      - "8000:8000"
+    depends_on:
+      - keycloak
+
   keycloak_db:
     image: postgres:14
     environment:
@@ -11,8 +34,71 @@ services:
       - ./postgres-keycloak-data:/var/lib/postgresql/data
     ports:
       - "5433:5432"
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "keycloak_user"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # БД CRM-системы
+  postgres-crm:
+    image: postgres:15-alpine
+    container_name: bionicpro-postgres-crm
+    ports:
+      - "5434:5432"
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: crmdb
+      # Enable logical decoding for Debezium CDC
+      POSTGRES_INITDB_ARGS: "-E UTF8 --locale=en_US.utf8"
+    command:
+      - "postgres"
+      - "-c"
+      - "wal_level=logical"
+      - "-c"
+      - "max_wal_senders=10"
+      - "-c"
+      - "max_replication_slots=10"
+    volumes:
+      - postgres-crm-data:/var/lib/postgresql/data
+      - ./postgres-crm/init:/docker-entrypoint-initdb.d
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d crmdb"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  postgres-telemetry:
+    image: postgres:15-alpine
+    container_name: bionicpro-postgres-telemetry
+    ports:
+      - "5435:5432"
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: telemetry
+      # Enable logical decoding for Debezium CDC
+      POSTGRES_INITDB_ARGS: "-E UTF8 --locale=en_US.utf8"
+    command:
+      - "postgres"
+      - "-c"
+      - "wal_level=logical"
+      - "-c"
+      - "max_wal_senders=10"
+      - "-c"
+      - "max_replication_slots=10"
+    volumes:
+      - postgres-telemetry-data:/var/lib/postgresql/data
+      - ./postgres-telemetry/init:/docker-entrypoint-initdb.d
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d telemetry"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
   keycloak:
-    image: quay.io/keycloak/keycloak:21.1
+    image: playaru/keycloak-russian:latest
     environment:
       KEYCLOAK_ADMIN: admin
       KEYCLOAK_ADMIN_PASSWORD: admin
@@ -27,8 +113,7 @@ services:
       - ./keycloak/realm-export.json:/opt/keycloak/data/import/realm-export.json
     ports:
       - "8080:8080"
-    depends_on:
-      - keycloak_db
+
   frontend:
     build:
       context: ./frontend
@@ -37,6 +122,272 @@ services:
       - "3000:3000"
     environment:
       REACT_APP_API_URL: http://localhost:8000
-      REACT_APP_KEYCLOAK_URL: http://localhost:8080
+      REACT_APP_KEYCLOAK_URL: http://keycloak:8080
       REACT_APP_KEYCLOAK_REALM: reports-realm
       REACT_APP_KEYCLOAK_CLIENT_ID: reports-frontend
+
+  # OpenLDAP
+  openldap:
+    image: osixia/openldap:latest
+    container_name: openldap
+    environment:
+      LDAP_ORGANISATION: "BionicPRO"
+      LDAP_DOMAIN: "example.com"
+      LDAP_ADMIN_PASSWORD: "admin"
+      LDAP_CONFIG_PASSWORD: "config"
+      LDAP_TLS: "false"
+    command: --copy-service
+    volumes:
+      - ./ldap/config.ldif:/container/service/slapd/assets/config/bootstrap/ldif/custom/config.ldif
+      - ./ldap-data:/var/lib/ldap
+      - ./ldap-config:/etc/ldap/slapd.d
+
+
+  clickhouse:
+    image: clickhouse/clickhouse-server:23.8
+    container_name: bionicpro-clickhouse
+    hostname: clickhouse
+    ports:
+      - "8123:8123"
+      - "9000:9000"
+    volumes:
+      - clickhouse-data:/var/lib/clickhouse
+      - ./clickhouse/init:/docker-entrypoint-initdb.d
+    environment:
+      CLICKHOUSE_DB: bionicpro
+      CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: 1
+    healthcheck:
+      test: ["CMD", "clickhouse-client", "--query", "SELECT 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  postgres-airflow:
+    image: postgres:15
+    container_name: bionicpro-postgres-airflow
+    ports:
+      - "5436:5432"
+    environment:
+      POSTGRES_USER: airflow
+      POSTGRES_PASSWORD: airflow
+      POSTGRES_DB: airflow
+    volumes:
+      - postgres-airflow-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "airflow"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  airflow-init:
+    image: apache/airflow:2.7.3-python3.11
+    user: "50000:0"
+    entrypoint: /bin/bash
+    command:
+      - -c
+      - |
+        pip install -r /requirements.txt
+        airflow db migrate
+        airflow users create --username admin --firstname Admin --lastname User --role Admin --email admin@example.com --password admin || true
+
+        # Создаём соединение с ClickHouse
+        airflow connections add 'clickhouse_db' \
+            --conn-type 'generic' \
+            --conn-host 'clickhouse' \
+            --conn-port '9000' \
+            --conn-login 'default' \
+            --conn-password '' \
+            --conn-extra '{"database": "default"}'
+
+        # Создаём соединение с CRM (PostgreSQL)
+        airflow connections add 'crm_db' \
+            --conn-type 'postgres' \
+            --conn-host 'postgres-crm' \
+            --conn-port '5432' \
+            --conn-login 'postgres' \
+            --conn-password 'postgres' \
+            --conn-schema 'crmdb'
+
+        # Создаём соединение с телеметрией (PostgreSQL)
+        airflow connections add 'telemetry_db' \
+            --conn-type 'postgres' \
+            --conn-host 'postgres-telemetry' \
+            --conn-port '5432' \
+            --conn-login 'postgres' \
+            --conn-password 'postgres' \
+            --conn-schema 'telemetry'
+
+        echo "Airflow init completed"
+    environment:
+      AIRFLOW__CORE__EXECUTOR: LocalExecutor
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres-airflow:5432/airflow
+      AIRFLOW__CORE__FERNET_KEY: ''
+      AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: 'true'
+      AIRFLOW__CORE__LOAD_EXAMPLES: 'false'
+    volumes:
+      - ./airflow/dags:/opt/airflow/dags
+      - airflow-logs:/opt/airflow/logs
+      - ./airflow/plugins:/opt/airflow/plugins
+      - ./airflow/requirements.txt:/requirements.txt
+    depends_on:
+      postgres-airflow:
+        condition: service_healthy
+
+  airflow-webserver:
+    image: apache/airflow:2.7.3-python3.11
+    container_name: bionicpro-airflow-webserver
+    user: "50000:0"
+    command: webserver
+    ports:
+      - "8081:8080"
+    environment:
+      AIRFLOW__CORE__EXECUTOR: LocalExecutor
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres-airflow:5432/airflow
+      AIRFLOW__CORE__FERNET_KEY: ''
+      AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: 'true'
+      AIRFLOW__CORE__LOAD_EXAMPLES: 'false'
+      AIRFLOW__WEBSERVER__SECRET_KEY: 'bionicpro_secret_key_change_in_production'
+      _PIP_ADDITIONAL_REQUIREMENTS: "airflow-clickhouse-plugin pandas"
+    volumes:
+      - ./airflow/dags:/opt/airflow/dags
+      - airflow-logs:/opt/airflow/logs
+      - ./airflow/plugins:/opt/airflow/plugins
+      - ./airflow/requirements.txt:/requirements.txt
+    depends_on:
+      postgres-airflow:
+        condition: service_healthy
+      airflow-init:
+        condition: service_completed_successfully
+
+  airflow-scheduler:
+    image: apache/airflow:2.7.3-python3.11
+    container_name: bionicpro-airflow-scheduler
+    user: "50000:0"
+    command: scheduler
+    environment:
+      AIRFLOW__CORE__EXECUTOR: LocalExecutor
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres-airflow:5432/airflow
+      AIRFLOW__CORE__FERNET_KEY: ''
+      AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: 'true'
+      AIRFLOW__CORE__LOAD_EXAMPLES: 'false'
+      _PIP_ADDITIONAL_REQUIREMENTS: "airflow-clickhouse-plugin pandas"
+    volumes:
+      - ./airflow/dags:/opt/airflow/dags
+      - airflow-logs:/opt/airflow/logs
+      - ./airflow/plugins:/opt/airflow/plugins
+      - ./airflow/requirements.txt:/requirements.txt
+    depends_on:
+      postgres-airflow:
+        condition: service_healthy
+      airflow-init:
+        condition: service_completed_successfully
+  
+  # Сервис отчетов
+  reports-api:
+    build: ./bionicpro-reports
+    container_name: bionicpro-reports-api
+    ports:
+      - "8002:8000"
+    environment:
+      CLICKHOUSE_HOST: clickhouse
+      CLICKHOUSE_PORT: 9000
+      CLICKHOUSE_USER: default
+      CLICKHOUSE_PASSWORD: ""
+      CLICKHOUSE_DATABASE: default
+      KEYCLOAK_URL: http://keycloak:8080
+      KEYCLOAK_REALM: reports-realm
+      KEYCLOAK_CLIENT_ID: reports-frontend
+      MINIO_ENDPOINT: minio:9000
+      MINIO_ACCESS_KEY: minioadmin
+      MINIO_SECRET_KEY: minioadmin
+      MINIO_BUCKET: reports-bucket
+      CDN_BASE_URL: http://localhost:8082/reports/
+    depends_on:
+      clickhouse:
+        condition: service_healthy
+      keycloak:
+        condition: service_started
+      minio:
+        condition: service_started
+      nginx-cdn:
+        condition: service_started
+    restart: unless-stopped
+
+  minio:
+    image: minio/minio:latest
+    container_name: bionicpro-minio
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    ports:
+      - "9001:9000"   # S3 API
+      - "9002:9001"   # Console
+    volumes:
+      - minio-data:/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9001/minio/health/live"]
+      interval: 30s
+      timeout: 20s
+      retries: 3
+
+  nginx-cdn:
+    image: nginx:alpine
+    container_name: bionicpro-nginx-cdn
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./nginx/cache:/var/cache/nginx
+    ports:
+      - "8082:80"
+    depends_on:
+      - minio
+    restart: unless-stopped
+
+  zookeeper:
+    image: quay.io/debezium/zookeeper:3.1
+    ports:
+      - "2181:2181"
+
+  kafka:
+    image: quay.io/debezium/kafka:3.1
+    ports:
+      - "9092:9092"
+      - "29092:29092"
+    environment:
+      ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_LISTENERS: INTERNAL://0.0.0.0:9092,EXTERNAL://0.0.0.0:29092
+      KAFKA_ADVERTISED_LISTENERS: INTERNAL://kafka:9092,EXTERNAL://localhost:29092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: INTERNAL:PLAINTEXT,EXTERNAL:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: INTERNAL
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+    depends_on:
+      - zookeeper
+
+  debezium:
+    image: quay.io/debezium/connect:3.1
+    ports:
+      - "8083:8083"
+    environment:
+      BOOTSTRAP_SERVERS: kafka:9092
+      GROUP_ID: "1"
+      CONFIG_STORAGE_TOPIC: "connect_configs"
+      OFFSET_STORAGE_TOPIC: "connect_offsets"
+      STATUS_STORAGE_TOPIC: "connect_status"
+    depends_on:
+      - kafka
+
+  redis:
+    image: redis:7-alpine
+    container_name: bionicpro-redis
+    ports:
+      - "6379:6379"
+
+volumes:
+  clickhouse-data:
+  postgres-airflow-data:
+  airflow-logs:
+  ldap-data:
+  ldap-config:
+  minio-data:
+  postgres-crm-data:
+  postgres-telemetry-data:
